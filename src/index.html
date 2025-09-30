@@ -1,32 +1,667 @@
 <!DOCTYPE html>
-<html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <link rel="stylesheet" href="styles.css" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>PakePlus App</title>
-        <script type="module" src="/main.js" defer></script>
-    </head>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>基于平准化度电（LCOE）的风力发电成本计算软件</title>
+  <!-- TailwindCSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React / ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel Standalone -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- FileSaver.js for CSV -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+  <!-- dom-to-image for PNG 导出 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
+  <style>
+    /* 额外的小样式：滚动条与代码区美化 */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <div id="root"></div>
 
-    <body>
-        <main class="container">
-            <h1>Welcome to PakePlus</h1>
-            <form class="row" id="greet-form">
-                <input id="inputValue" placeholder="Enter a something..." />
-            </form>
-            <div class="resultBox">
-                <span>result: </span>
-                <span id="result"></span>
+  <!-- ================= App Script ================= -->
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    /***************************************************
+     * 工具函数区域
+     ***************************************************/
+    // 防抖：避免频繁计算或绘图
+    function useDebouncedEffect(effect, deps, delay = 150) {
+      useEffect(() => {
+        const handler = setTimeout(() => effect(), delay);
+        return () => clearTimeout(handler);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [...(deps || []), delay]);
+    }
+
+    // CSV 导出
+    function exportToCSV(objArray, filename = 'lcoe_results.csv') {
+      const data = Array.isArray(objArray) ? objArray : [objArray];
+      if (data.length === 0) return;
+      const headers = Object.keys(data[0]);
+      const rows = data.map(row => headers.map(h => String(row[h] ?? '')).join(','));
+      const csvContent = [headers.join(','), ...rows].join('\n');
+      const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
+      saveAs(blob, filename);
+    }
+
+    // 下载 PNG（将某个容器转为图片）
+    async function downloadPNGFromNode(node, filename = 'lcoe_dashboard.png') {
+      if (!node) return;
+      try {
+        const dataUrl = await domtoimage.toPng(node, { quality: 1 });
+        const link = document.createElement('a');
+        link.download = filename;
+        link.href = dataUrl;
+        link.click();
+      } catch (e) {
+        alert('导出PNG失败：' + e.message);
+      }
+    }
+
+    // 数字格式化：千分位 + 固定小数位
+    const fmt = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 });
+    const fmt0 = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 });
+    const fmt2 = new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    // 限制范围
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+    // 深拷贝（简易）
+    const deepCopy = (o) => JSON.parse(JSON.stringify(o));
+
+    /***************************************************
+     * 经济学核心计算 —— LCOE
+     * LCOE = ∑(t=0..N) 成本_t / (1+r)^t  ÷  ∑(t=0..N) 发电量_t / (1+r)^t
+     * 本实现包含：CAPEX（t=0）+ 年度 OPEX + 可选的退役成本（在寿命末期）
+     ***************************************************/
+    function calculateLCOE(params) {
+      const {
+        lifetime,           // 项目寿命（年）
+        capacityMW,         // 装机容量（MW）
+        turbineCost,        // 风机单价（元/kW）
+        opex,               // 年 OPEX（元/年）
+        discountRate,       // 折现率（小数）
+        utilizationHours,   // 年平均利用小时（h）
+        capexExtraRate,     // 额外CAPEX比例（含土建并网等）
+        decommissionCost,   // 退役成本（发生在寿命末年）
+        availFactor,        // 可利用率（0-1）
+        lossRate,           // 综合损耗（0-1）
+        fixedOpexRate,      // 按装机容量计提的固定运维率（元/kW/年），与 opex 可叠加
+        variableOpexRate,   // 随发电量的变动运维（元/kWh）
+      } = params;
+
+      // 转换
+      const capacityKW = capacityMW * 1000; // kW
+      const capexEquip = capacityKW * turbineCost; // 设备投资
+      const capexTotal = capexEquip * (1 + (capexExtraRate || 0)); // 含其它CAPEX
+
+      // 年发电量（kWh）：容量(MW)*小时*1000 * 可利用率 * (1-损耗)
+      const annualGenKWhBase = capacityMW * utilizationHours * 1000;
+      const annualGenKWh = annualGenKWhBase * (availFactor ?? 1) * (1 - (lossRate ?? 0));
+
+      // 折现累计
+      let discountedGen = 0;
+      let discountedCost = capexTotal; // t=0 投资
+
+      for (let t = 1; t <= lifetime; t++) {
+        const df = Math.pow(1 + discountRate, t);
+        const fixedOpex = (fixedOpexRate || 0) * capacityKW; // 元/年
+        const variableOpex = (variableOpexRate || 0) * annualGenKWh; // 元/年
+        const totalOpex = (opex || 0) + fixedOpex + variableOpex;
+
+        discountedGen += annualGenKWh / df;
+        discountedCost += totalOpex / df;
+
+        if (t === lifetime && (decommissionCost || 0) > 0) {
+          discountedCost += decommissionCost / df;
+        }
+      }
+
+      const lcoe = discountedCost / discountedGen; // 元/kWh
+      return {
+        lcoe,
+        capexEquip,
+        capexTotal,
+        annualGenKWh,
+        discountedCost,
+        discountedGen,
+      };
+    }
+
+    /***************************************************
+     * 组件：输入控件（带标签、范围、数值框）
+     ***************************************************/
+    function Field({ label, hint, type = 'number', min, max, step, value, onChange, unit, id }) {
+      const inputId = id || label;
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <label htmlFor={inputId} className="text-sm font-medium text-slate-700">{label}</label>
+            {hint && <span className="text-xs text-slate-500">{hint}</span>}
+          </div>
+          <input
+            id={inputId + '-range'}
+            type="range"
+            min={min}
+            max={max}
+            step={step}
+            value={value}
+            onChange={(e) => onChange(type === 'number' ? Number(e.target.value) : e.target.value)}
+            className="w-full"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              id={inputId}
+              type={type}
+              min={min}
+              max={max}
+              step={step}
+              value={value}
+              onChange={(e) => onChange(type === 'number' ? Number(e.target.value) : e.target.value)}
+              className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+            />
+            {unit && <span className="text-sm text-slate-600">{unit}</span>}
+          </div>
+        </div>
+      );
+    }
+
+    /***************************************************
+     * 组件：信息卡片
+     ***************************************************/
+    function StatCard({ title, value, suffix, secondary, accent='emerald' }) {
+      const accentMap = {
+        emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        sky: 'bg-sky-50 text-sky-700 border-sky-200',
+        orange: 'bg-orange-50 text-orange-700 border-orange-200',
+        rose: 'bg-rose-50 text-rose-700 border-rose-200',
+        violet: 'bg-violet-50 text-violet-700 border-violet-200',
+      };
+      return (
+        <div className={`border rounded-xl p-4 ${accentMap[accent]} shadow-sm`}> 
+          <div className="text-xs uppercase tracking-wider opacity-70">{title}</div>
+          <div className="mt-2 text-2xl font-semibold">
+            {value}{suffix && <span className="text-base ml-1">{suffix}</span>}
+          </div>
+          {secondary && <div className="text-xs mt-1 opacity-70">{secondary}</div>}
+        </div>
+      );
+    }
+
+    /***************************************************
+     * 组件：帮助说明 / 页脚
+     ***************************************************/
+    function HelpPanel() {
+      return (
+        <div className="prose prose-slate max-w-none">
+          <h2>说明</h2>
+          <ul>
+            <li><strong>LCOE（Levelized Cost of Energy）</strong> 即平准化度电成本，用来比较不同能源在全寿命周期内的发电成本。</li>
+            <li>本工具在浏览器本地运行，不上传任何数据；参数更改后立即重新计算。</li>
+            <li>支持导出 <code>CSV</code>与 <code>PNG</code>。</li>
+          </ul>
+          <h3>计算假设</h3>
+          <ol>
+            <li>初始投资（CAPEX）发生在 <code>t=0</code>。</li>
+            <li>运维成本（OPEX）与发电量（kWh）每年相同，按折现率贴现。</li>
+            <li>可选退役成本在寿命末年计入贴现。</li>
+            <li>可利用率、损耗、变动运维影响年度有效发电量与年度成本。</li>
+          </ol>
+        </div>
+      );
+    }
+
+    /***************************************************
+     * 组件：图表模块（Chart.js）
+     ***************************************************/
+    function Charts({ params, result }) {
+      const pieRef = useRef(null);
+      const lineRef = useRef(null);
+      const pieCanvasRef = useRef(null);
+      const lineCanvasRef = useRef(null);
+
+      // 重绘
+      useDebouncedEffect(() => {
+        if (!result) return;
+
+        // 饼图：CAPEX vs OPEX 总和（全寿命）
+        if (pieRef.current) pieRef.current.destroy();
+        const pieCtx = pieCanvasRef.current.getContext('2d');
+        const totalOpexLifetime = ((params.opex || 0) + (params.fixedOpexRate || 0) * (params.capacityMW*1000) + (params.variableOpexRate || 0) * result.annualGenKWh) * params.lifetime;
+        pieRef.current = new Chart(pieCtx, {
+          type: 'pie',
+          data: {
+            labels: ['CAPEX（总投资）', 'OPEX（寿命期累计）', '退役成本（终年）'],
+            datasets: [{
+              data: [result.capexTotal, totalOpexLifetime, params.decommissionCost || 0],
+              backgroundColor: ['#34D399', '#60A5FA', '#F59E0B'],
+            }]
+          },
+          options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+        });
+
+        // 折线：敏感性（折现率、寿命）
+        if (lineRef.current) lineRef.current.destroy();
+        const lineCtx = lineCanvasRef.current.getContext('2d');
+        const rates = [0.02, 0.04, 0.06, 0.08, 0.1, 0.15, 0.2];
+        const lifetimes = [10, 15, 20, 25, 30, 40, 50];
+        const lcoeByRate = rates.map(r => calculateLCOE({ ...params, discountRate: r }).lcoe);
+        const lcoeByLife = lifetimes.map(L => calculateLCOE({ ...params, lifetime: L }).lcoe);
+
+        lineRef.current = new Chart(lineCtx, {
+          type: 'line',
+          data: {
+            labels: rates.map(r => (r*100).toFixed(0) + '%'),
+            datasets: [
+              {
+                label: '折现率 vs LCOE',
+                data: lcoeByRate,
+                borderColor: '#F87171',
+                tension: 0.35,
+              },
+              {
+                label: '寿命 vs LCOE（右轴）',
+                data: lcoeByLife,
+                yAxisID: 'y1',
+                borderColor: '#34D399',
+                tension: 0.35,
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+              y: { title: { display: true, text: 'LCOE (元/kWh)' } },
+              y1: { position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'LCOE (元/kWh)' } }
+            },
+            plugins: { legend: { position: 'bottom' } }
+          }
+        });
+      }, [params, result]);
+
+      return (
+        <section className="bg-white p-4 rounded-2xl shadow border">
+          <h2 className="text-lg font-semibold mb-4">图表分析</h2>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-slate-50 rounded-xl p-4 shadow-inner">
+              <div className="font-medium mb-2">成本结构（CAPEX / OPEX / 退役）</div>
+              <canvas ref={pieCanvasRef} height="200"/>
             </div>
-            <div class="invokeBox">
-                <button id="openUrl">open_url_browser</button>
-                <button id="openUrlNew">open_url_new</button>
-                <button id="runCommand">run_command</button>
-                <button id="downloadFile">download_file</button>
-                <button id="getExeDir">get_exe_dir</button>
-                <button id="getEnvVar">get_env_var</button>
-                <button id="findPort">find_port</button>
+            <div className="bg-slate-50 rounded-xl p-4 shadow-inner">
+              <div className="font-medium mb-2">LCOE 敏感性（折现率、寿命）</div>
+              <canvas ref={lineCanvasRef} height="200"/>
             </div>
-        </main>
-    </body>
+          </div>
+        </section>
+      );
+    }
+
+    /***************************************************
+     * 组件：情景管理（保存/载入多个参数集）
+     ***************************************************/
+    function ScenarioManager({ scenarioList, onSave, onLoad, onDelete, onClear }) {
+      const [name, setName] = useState('情景' + Math.floor(Math.random()*1000));
+      return (
+        <section className="bg-white p-4 rounded-2xl shadow border">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold">情景管理</h2>
+            <button onClick={onClear} className="text-xs text-rose-600 hover:underline">清空全部</button>
+          </div>
+          <div className="flex gap-2 items-center">
+            <input value={name} onChange={e=>setName(e.target.value)} placeholder="情景名称" className="border rounded-lg px-3 py-2 w-48" />
+            <button onClick={()=>onSave(name)} className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg">保存当前参数</button>
+          </div>
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 max-h-64 overflow-auto">
+            {scenarioList.length === 0 && <div className="text-sm text-slate-500">暂无情景，输入参数后可点击“保存当前参数”。</div>}
+            {scenarioList.map((s, idx) => (
+              <div key={idx} className="border rounded-xl p-3 flex flex-col gap-2">
+                <div className="font-medium truncate" title={s.name}>{s.name}</div>
+                <div className="text-xs text-slate-500">
+                  {fmt0.format(s.params.capacityMW)} MW · {fmt0.format(s.params.utilizationHours)} h · r={Math.round(s.params.discountRate*100)}%
+                </div>
+                <div className="flex gap-2 mt-auto">
+                  <button onClick={()=>onLoad(idx)} className="px-2 py-1 rounded bg-sky-600 text-white text-xs">载入</button>
+                  <button onClick={()=>onDelete(idx)} className="px-2 py-1 rounded bg-slate-100 text-slate-700 text-xs">删除</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      );
+    }
+
+    /***************************************************
+     * 组件：蒙特卡洛模拟（对关键参数设定分布，输出 LCOE 分布）
+     ***************************************************/
+    function MonteCarlo({ baseParams, onCSV }) {
+      const [runs, setRuns] = useState(200);
+      const [drift, setDrift] = useState({
+        turbineCost: 0.1, // ±10%
+        opex: 0.15,       // ±15%
+        utilizationHours: 0.08, // ±8%
+        discountRate: 0.2 // ±20%
+      });
+      const [stats, setStats] = useState(null);
+
+      function sampleAround(val, pct){
+        const min = val*(1-pct), max = val*(1+pct);
+        return min + Math.random()*(max-min);
+      }
+
+      function runSim(){
+        const arr = [];
+        for(let i=0;i<runs;i++){
+          const p = deepCopy(baseParams);
+          p.turbineCost = sampleAround(p.turbineCost, drift.turbineCost);
+          p.opex = sampleAround(p.opex, drift.opex);
+          p.utilizationHours = sampleAround(p.utilizationHours, drift.utilizationHours);
+          p.discountRate = clamp(sampleAround(p.discountRate, drift.discountRate), 0.001, 0.5);
+          const { lcoe } = calculateLCOE(p);
+          arr.push(lcoe);
+        }
+        arr.sort((a,b)=>a-b);
+        const n = arr.length;
+        const mean = arr.reduce((a,b)=>a+b,0)/n;
+        const p5 = arr[Math.floor(0.05*n)];
+        const p50 = arr[Math.floor(0.5*n)];
+        const p95 = arr[Math.floor(0.95*n)];
+        setStats({ mean, p5, p50, p95, n, samples: arr });
+      }
+
+      function exportCSV(){
+        if(!stats) return;
+        exportToCSV(stats.samples.map((v,i)=>({序号: i+1, LCOE: v})), 'lcoe_monte_carlo.csv');
+        onCSV && onCSV();
+      }
+
+      return (
+        <section className="bg-white p-4 rounded-2xl shadow border">
+          <h2 className="text-lg font-semibold mb-4">蒙特卡洛模拟</h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Field label="模拟次数" min={50} max={5000} step={50} value={runs} onChange={setRuns} unit="次" />
+            <Field label="风机单价漂移" hint="±比例" min={0} max={0.5} step={0.01} value={drift.turbineCost} onChange={v=>setDrift({...drift, turbineCost: v})} />
+            <Field label="运维成本漂移" hint="±比例" min={0} max={0.5} step={0.01} value={drift.opex} onChange={v=>setDrift({...drift, opex: v})} />
+            <Field label="利用小时漂移" hint="±比例" min={0} max={0.5} step={0.01} value={drift.utilizationHours} onChange={v=>setDrift({...drift, utilizationHours: v})} />
+            <Field label="折现率漂移" hint="±比例" min={0} max={0.8} step={0.01} value={drift.discountRate} onChange={v=>setDrift({...drift, discountRate: v})} />
+          </div>
+          <div className="mt-4 flex gap-3">
+            <button onClick={runSim} className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white">开始模拟</button>
+            <button onClick={exportCSV} className="px-4 py-2 rounded-lg bg-slate-100 text-slate-800">导出CSV</button>
+          </div>
+          {stats && (
+            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+              <StatCard title="样本均值" value={fmt2.format(stats.mean)} suffix=" 元/kWh" />
+              <StatCard title="P5" value={fmt2.format(stats.p5)} suffix=" 元/kWh" accent='sky' />
+              <StatCard title="P50" value={fmt2.format(stats.p50)} suffix=" 元/kWh" accent='orange' />
+              <StatCard title="P95" value={fmt2.format(stats.p95)} suffix=" 元/kWh" accent='violet' />
+            </div>
+          )}
+        </section>
+      );
+    }
+
+    /***************************************************
+     * 主应用
+     ***************************************************/
+    function App(){
+      // 参数状态
+      const [params, setParams] = useState({
+        lifetime: 20,
+        capacityMW: 100,
+        turbineCost: 5000,      // 元/kW
+        opex: 2000000,          // 元/年
+        discountRate: 0.08,     // 8%
+        utilizationHours: 2500, // h
+        capexExtraRate: 0.25,   // 其它CAPEX（如土建、并网）
+        decommissionCost: 1000000, // 退役成本（元）
+        availFactor: 0.98,      // 可利用率
+        lossRate: 0.07,         // 综合损耗
+        fixedOpexRate: 30,      // 元/kW/年
+        variableOpexRate: 0.02, // 元/kWh
+      });
+
+      // 结果
+      const result = useMemo(()=>calculateLCOE(params), [params]);
+
+      // 情景列表（本地存储）
+      const [scenarios, setScenarios] = useState(()=>{
+        try { return JSON.parse(localStorage.getItem('lcoe_scenarios')||'[]'); } catch { return []; }
+      });
+      useEffect(()=>{
+        localStorage.setItem('lcoe_scenarios', JSON.stringify(scenarios));
+      }, [scenarios]);
+
+      // 导出 PNG 需要的容器引用
+      const dashboardRef = useRef(null);
+
+      // 表单字段更新
+      const bind = (key) => (v) => setParams(p => ({ ...p, [key]: v }));
+
+      // 导出 CSV（单条）
+      const handleExportCSV = () => {
+        const row = {
+          项目寿命_年: params.lifetime,
+          装机容量_MW: params.capacityMW,
+          风机单价_元每kW: params.turbineCost,
+          年运维成本_元: params.opex,
+          折现率: params.discountRate,
+          年利用小时_h: params.utilizationHours,
+          其他CAPEX比例: params.capexExtraRate,
+          退役成本_元: params.decommissionCost,
+          可利用率: params.availFactor,
+          损耗率: params.lossRate,
+          固定OPEX_元每kW年: params.fixedOpexRate,
+          变动OPEX_元每kWh: params.variableOpexRate,
+          计算_LCOE_元每kWh: result.lcoe,
+          年发电量_kWh: result.annualGenKWh,
+          CAPEX总额_元: result.capexTotal,
+          折现成本合计_元: result.discountedCost,
+          折现发电量合计_kWh: result.discountedGen,
+        };
+        exportToCSV(row);
+      };
+
+      // 导出 PNG
+      const handleExportPNG = () => downloadPNGFromNode(dashboardRef.current);
+
+      // 情景管理 API
+      const saveScenario = (name) => setScenarios(list => [...list, { name, params: deepCopy(params) }]);
+      const loadScenario = (idx) => setParams(deepCopy(scenarios[idx].params));
+      const deleteScenario = (idx) => setScenarios(list => list.filter((_,i)=>i!==idx));
+      const clearScenario = () => setScenarios([]);
+
+      // 预设按钮
+      const presets = [
+        { name: '陆上-中等风速', p: { lifetime: 25, capacityMW: 80, turbineCost: 4200, opex: 1.6e6, discountRate: 0.07, utilizationHours: 2600, capexExtraRate: 0.22, decommissionCost: 8e5, availFactor: 0.985, lossRate: 0.06, fixedOpexRate: 28, variableOpexRate: 0.018 }},
+        { name: '海上-高风速', p: { lifetime: 30, capacityMW: 200, turbineCost: 7800, opex: 5.2e6, discountRate: 0.09, utilizationHours: 3800, capexExtraRate: 0.35, decommissionCost: 2.4e6, availFactor: 0.97, lossRate: 0.1, fixedOpexRate: 45, variableOpexRate: 0.025 }},
+        { name: '分散式-低风速', p: { lifetime: 20, capacityMW: 10, turbineCost: 5200, opex: 38e4, discountRate: 0.1, utilizationHours: 1800, capexExtraRate: 0.18, decommissionCost: 2e5, availFactor: 0.99, lossRate: 0.05, fixedOpexRate: 26, variableOpexRate: 0.015 }},
+      ];
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* 顶部栏 */}
+          <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b">
+            <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-emerald-600 flex items-center justify-center text-white font-bold">W</div>
+                <div>
+                  <div className="text-lg font-semibold">基于 LCOE 的风力发电成本计算软件</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={handleExportCSV} className="px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-sm">导出 CSV</button>
+                <button onClick={handleExportPNG} className="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm">导出 PNG</button>
+              </div>
+            </div>
+          </header>
+
+          {/* 主体 */}
+          <main ref={dashboardRef} className="max-w-7xl mx-auto w-full px-4 py-6 space-y-6">
+            {/* 参数与结果 */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* 左：参数表单 */}
+              <section className="lg:col-span-2 bg-white rounded-2xl shadow border p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-lg font-semibold">输入参数</h2>
+                  <div className="flex items-center gap-2">
+                    {presets.map((pr, i) => (
+                      <button key={i} onClick={()=>setParams(p=>({...p, ...pr.p}))} className="px-2 py-1 rounded-lg bg-slate-100 text-slate-700 text-xs hover:bg-slate-200" title="应用预设">{pr.name}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  <Field label="项目寿命" hint="年" min={5} max={60} step={1} value={params.lifetime} onChange={bind('lifetime')} />
+                  <Field label="装机容量" hint="MW" min={1} max={1000} step={1} value={params.capacityMW} onChange={bind('capacityMW')} />
+                  <Field label="风机单价" hint="元/kW" min={1000} max={20000} step={100} value={params.turbineCost} onChange={bind('turbineCost')} />
+
+                  <Field label="年运维成本 OPEX" hint="元/年" min={1e5} max={2e7} step={1e5} value={params.opex} onChange={bind('opex')} />
+                  <Field label="折现率 r" hint="小数" min={0.0} max={0.3} step={0.005} value={params.discountRate} onChange={bind('discountRate')} />
+                  <Field label="年平均利用小时" hint="h" min={1000} max={8000} step={50} value={params.utilizationHours} onChange={bind('utilizationHours')} />
+
+                  <Field label="其它CAPEX比例" hint="如土建、并网等" min={0} max={1} step={0.01} value={params.capexExtraRate} onChange={bind('capexExtraRate')} />
+                  <Field label="退役成本" hint="发生在寿命末年" min={0} max={1e8} step={1e5} value={params.decommissionCost} onChange={bind('decommissionCost')} />
+                  <Field label="可利用率" hint="0-1" min={0.5} max={1} step={0.005} value={params.availFactor} onChange={bind('availFactor')} />
+
+                  <Field label="综合损耗率" hint="0-1" min={0} max={0.3} step={0.005} value={params.lossRate} onChange={bind('lossRate')} />
+                  <Field label="固定运维率" hint="元/kW/年" min={0} max={200} step={1} value={params.fixedOpexRate} onChange={bind('fixedOpexRate')} />
+                  <Field label="变动运维" hint="元/kWh" min={0} max={1} step={0.001} value={params.variableOpexRate} onChange={bind('variableOpexRate')} />
+                </div>
+              </section>
+
+              {/* 右：结果卡片 */}
+              <section className="bg-white rounded-2xl shadow border p-4 space-y-3">
+                <h2 className="text-lg font-semibold">计算结果</h2>
+                <StatCard title="平准化度电成本 LCOE" value={fmt2.format(result.lcoe)} suffix=" 元/kWh" />
+                <StatCard title="CAPEX 总投资" value={fmt0.format(result.capexTotal)} suffix=" 元" accent='sky' secondary={`设备投资：${fmt0.format(result.capexEquip)} 元`} />
+                <StatCard title="年发电量" value={fmt0.format(result.annualGenKWh)} suffix=" kWh" accent='orange' secondary={`考虑可利用率与损耗`} />
+                <StatCard title="折现成本合计" value={fmt0.format(result.discountedCost)} suffix=" 元" accent='rose' secondary={`折现发电量合计：${fmt0.format(result.discountedGen)} kWh`} />
+              </section>
+            </div>
+
+            {/* 图表 */}
+            <Charts params={params} result={result} />
+
+            {/* 情景 + 蒙特卡洛 */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <ScenarioManager
+                scenarioList={scenarios}
+                onSave={saveScenario}
+                onLoad={loadScenario}
+                onDelete={deleteScenario}
+                onClear={clearScenario}
+              />
+              <MonteCarlo baseParams={params} />
+            </div>
+
+            {/* 帮助说明 */}
+            <section className="bg-white p-6 rounded-2xl shadow border">
+              <HelpPanel />
+            </section>
+          </main>
+
+          {/* 页脚 */}
+          <footer className="border-t bg-white">
+            <div className="max-w-7xl mx-auto px-4 py-4 text-xs text-slate-500 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+              </div>
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    /***************************************************
+     * 键盘快捷键
+     ***************************************************/
+    function useHotkeys(callbacks){
+      useEffect(()=>{
+        const h = (e)=>{
+          if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return; // 编辑时不触发
+          const k = e.key.toLowerCase();
+          if (callbacks[k]) callbacks[k]();
+        };
+        window.addEventListener('keydown', h);
+        return ()=>window.removeEventListener('keydown', h);
+      }, [callbacks]);
+    }
+
+    function WithHotkeys(){
+      const appRef = useRef(null);
+      const [appKey, setAppKey] = useState(0); // 用于强制重渲染时替换组件
+      const app = <App key={appKey} ref={appRef}/>;
+
+      // 通过 ref 无法直接访问 App 内部方法，这里简化为分发自定义事件
+      function dispatch(name){ window.dispatchEvent(new CustomEvent(name)); }
+
+      useHotkeys({
+        'r': ()=> dispatch('preset-1'),
+        'c': ()=> dispatch('export-csv'),
+        'p': ()=> dispatch('export-png'),
+      });
+
+      return app;
+    }
+
+    /***************************************************
+     * 将事件与 App 绑定（利用全局事件总线）
+     ***************************************************/
+    function Bootstrap(){
+      const appRef = useRef(null);
+      const [params, setParams] = useState(null); // 仅用于事件演示
+
+      // 提供对 App 的轻量控制：用一个隐藏的桥组件与 window 事件沟通
+      return (
+        <AppBridge />
+      );
+    }
+
+    function AppBridge(){
+      const [appParams, setAppParams] = useState(null);
+      const appRef = useRef(null);
+
+      // 在这里重新实现 App 并向下传递事件
+      // 实际上我们直接渲染 App，并在 document 级别监听事件，将其映射为按钮点击
+      useEffect(()=>{
+        const onPreset1 = ()=>{
+          const evt = new Event('click');
+          const btn = document.querySelector('button[title="应用预设"]');
+          if (btn) btn.dispatchEvent(evt);
+        };
+        const onExportCSV = ()=>{
+          const btns = Array.from(document.querySelectorAll('button')).filter(b=>b.textContent.includes('导出 CSV'));
+          if (btns[0]) btns[0].click();
+        };
+        const onExportPNG = ()=>{
+          const btns = Array.from(document.querySelectorAll('button')).filter(b=>b.textContent.includes('导出 PNG'));
+          if (btns[0]) btns[0].click();
+        };
+        window.addEventListener('preset-1', onPreset1);
+        window.addEventListener('export-csv', onExportCSV);
+        window.addEventListener('export-png', onExportPNG);
+        return ()=>{
+          window.removeEventListener('preset-1', onPreset1);
+          window.removeEventListener('export-csv', onExportCSV);
+          window.removeEventListener('export-png', onExportPNG);
+        };
+      }, []);
+
+      return (<App ref={appRef} />);
+    }
+
+    // 渲染
+    ReactDOM.createRoot(document.getElementById('root')).render(<Bootstrap/>);
+  </script>
+</body>
 </html>
